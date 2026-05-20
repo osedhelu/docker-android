@@ -5,8 +5,12 @@
 #
 set -euo pipefail
 
-SCRIPT_VERSION="1.5"
+SCRIPT_VERSION="1.6"
 REMOTE_HOST="${REMOTE_HOST:-serverlocal-ubuntu}"
+REMOTE_DEVICE_DIR="${REMOTE_DEVICE_DIR:-/home/osedhelu/android/docker-android}"
+REMOTE_DEVICE_FILE="${REMOTE_DEVICE_FILE:-${REMOTE_DEVICE_DIR}/.selected-device}"
+LOCAL_DEVICE_FILE="${LOCAL_DEVICE_FILE:-${HOME}/.selected-device}"
+DEVICE_SERIAL="${DEVICE_SERIAL:-}"
 ADB_PORT="${ADB_SERVER_PORT:-5037}"
 export ADB_SERVER_PORT="${ADB_PORT}"
 # Puertos de vídeo/control de scrcpy (deben coincidir con --port= en scrcpy)
@@ -32,8 +36,42 @@ connect-device-mac.sh v${SCRIPT_VERSION}
   ./connect-mac.sh              Mata todo lo anterior y crea conexión nueva
   ./connect-mac.sh --disconnect Solo limpia
   ./connect-mac.sh --test-only  Prueba (túnel ya abierto)
-  ./connect-mac.sh --scrcpy     Abre scrcpy (túneles deben existir)
+  ./connect-mac.sh --scrcpy           Abre scrcpy
+  ./connect-mac.sh --list-devices     Lista dispositivos en el servidor
+  ./connect-mac.sh --device SERIAL    Usa ese dispositivo (ej: N82)
+
+Variables:
+  DEVICE_SERIAL          Serial ADB (si no, lee ~/.selected-device o servidor)
 EOF
+}
+
+resolve_device_serial() {
+  local serial="${DEVICE_SERIAL}"
+
+  if [[ -z "${serial}" && -f "${LOCAL_DEVICE_FILE}" ]]; then
+    serial=$(tr -d '[:space:]' < "${LOCAL_DEVICE_FILE}")
+  fi
+
+  if [[ -z "${serial}" ]]; then
+    serial=$(ssh -o BatchMode=yes -o ConnectTimeout=8 "${REMOTE_HOST}" \
+      "cat '${REMOTE_DEVICE_FILE}' 2>/dev/null" | tr -d '[:space:]' || true)
+  fi
+
+  if [[ -n "${serial}" ]]; then
+    echo "${serial}"
+    return 0
+  fi
+
+  # Fallback: primer dispositivo físico
+  adb_via_server devices 2>/dev/null | grep -E '[[:space:]]device$' | grep -v offline | awk '{print $1; exit}'
+}
+
+list_remote_devices() {
+  ssh -o BatchMode=yes -o ConnectTimeout=10 "${REMOTE_HOST}" \
+    "cd '${REMOTE_DEVICE_DIR}' && ./scripts/setup-device-server.sh list" 2>/dev/null || {
+    error "No se pudo listar. En el servidor: ./scripts/setup-device-server.sh list"
+    return 1
+  }
 }
 
 port_pids() {
@@ -163,16 +201,18 @@ test_connection() {
   sleep 1
 
   echo ""
-  echo "=== adb devices (Mac → servidor → N82) ==="
+  echo "=== adb devices (Mac → servidor) ==="
   adb_via_server devices -l
   echo ""
 
   local serial state
-  serial=$(adb_via_server devices | grep -E '[[:space:]]device$' | grep -v offline | awk '{print $1; exit}')
+  serial=$(resolve_device_serial)
   if [[ -z "${serial}" ]]; then
-    error "No hay dispositivo 'device'. Vuelve a ejecutar: ~/connect-mac.sh"
+    error "No hay dispositivo 'device'."
+    error "En el servidor: ./scripts/setup-device-server.sh"
     return 1
   fi
+  info "Usando dispositivo: ${serial}"
 
   state=$(adb_via_server -s "${serial}" get-state 2>/dev/null || echo "missing")
   [[ "${state}" == "device" ]] || {
@@ -193,7 +233,7 @@ test_connection() {
 
 run_scrcpy() {
   local serial
-  serial=$(adb_via_server devices | grep -E '[[:space:]]device$' | grep -v offline | awk '{print $1; exit}')
+  serial=$(resolve_device_serial)
   [[ -n "${serial}" ]] || { error "Sin dispositivo. Ejecuta ~/connect-mac.sh primero."; return 1; }
   command -v scrcpy >/dev/null 2>&1 || { error "Instala scrcpy: brew install scrcpy"; return 1; }
   info "Abriendo scrcpy (${serial})..."
@@ -206,13 +246,19 @@ main() {
     case "$1" in
       --disconnect) mode="disconnect"; shift ;;
       --test-only)  mode="test"; shift ;;
-      --scrcpy)     mode="scrcpy"; shift ;;
+      --scrcpy)         mode="scrcpy"; shift ;;
+      --list-devices)   mode="list"; shift ;;
+      --device)
+        DEVICE_SERIAL="${2:-}"
+        [[ -n "${DEVICE_SERIAL}" ]] || { error "Falta serial: --device N82"; exit 1; }
+        shift 2
+        ;;
       -h|--help)    usage; exit 0 ;;
       *) error "Opción: $1"; usage; exit 1 ;;
     esac
   done
 
-  echo "=== N82 → Mac v${SCRIPT_VERSION} (sin Docker) ==="
+  echo "=== Dispositivo físico → Mac v${SCRIPT_VERSION} ==="
   echo "Servidor: ${REMOTE_HOST}  |  ADB: ${ADB_PORT}  |  scrcpy: ${SCRCPY_PORTS[*]}"
   echo ""
 
@@ -230,6 +276,10 @@ main() {
     scrcpy)
       export ADB_SERVER_PORT="${ADB_PORT}"
       run_scrcpy "$@"
+      exit $?
+      ;;
+    list)
+      list_remote_devices
       exit $?
       ;;
   esac
